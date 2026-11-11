@@ -1,0 +1,197 @@
+diff --git a/src/EPD_Painter.cpp b/src/EPD_Painter.cpp
+index 8dedd64..94fb523 100644
+--- a/src/EPD_Painter.cpp
++++ b/src/EPD_Painter.cpp
+@@ -8,7 +8,7 @@
+ #include "esp_task_wdt.h"
+ #include "esp_heap_caps.h"
+ #include "esp_rom_gpio.h"
+-#include <driver/periph_ctrl.h>
++#include <esp_private/periph_ctrl.h>
+ #include <esp_private/gdma.h>
+ #include <hal/dma_types.h>
+ #include <hal/gpio_hal.h>
+@@ -710,8 +710,8 @@ bool EPD_Painter::begin() {
+     .direction = GDMA_CHANNEL_DIRECTION_TX,
+     .flags = { .reserve_sibling = 0 },
+   };
+-  gdma_new_channel(&dma_chan_config, &dma_chan);
+-  gdma_connect(dma_chan, GDMA_MAKE_TRIGGER(GDMA_TRIG_PERIPH_LCD, 0));
++  if (gdma_new_ahb_channel(&dma_chan_config, &dma_chan) != ESP_OK) return false;
++  if (gdma_connect(dma_chan, GDMA_MAKE_TRIGGER(GDMA_TRIG_PERIPH_LCD, 0)) != ESP_OK) return false;
+ 
+   // Cache the GDMA channel index for direct register access in sendRow().
+   // LCD_CAM is peripheral 5 in the GDMA peri_sel register.
+@@ -724,7 +724,7 @@ bool EPD_Painter::begin() {
+     .owner_check = false,
+     .auto_update_desc = false,
+   };
+-  gdma_apply_strategy(dma_chan, &strategy_config);
++  if (gdma_apply_strategy(dma_chan, &strategy_config) != ESP_OK) return false;
+ 
+   // ---- Allocate DMA row buffers ----
+   dma_buffer1 = static_cast<uint8_t *>(
+@@ -732,6 +732,8 @@ bool EPD_Painter::begin() {
+   dma_buffer2 = static_cast<uint8_t *>(
+     heap_caps_aligned_alloc(16, dma_row_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+ 
++  if (!dma_buffer1 || !dma_buffer2) return false;
++
+   // Zero both buffers once so the pad region stays neutral forever —
+   // pixel converts only ever write the first packed_row_bytes.
+   memset(dma_buffer1, 0x00, dma_row_bytes);
+@@ -762,7 +764,7 @@ bool EPD_Painter::begin() {
+   packed_fastbuffer = static_cast<uint8_t *>(
+     heap_caps_aligned_alloc(16, packed_size, MALLOC_CAP_INTERNAL));
+   if (!packed_fastbuffer) {
+-    log_w("[EPD] packed_fastbuffer: internal alloc failed, retrying in PSRAM");
++    EPD_WARN("[EPD] packed_fastbuffer: internal alloc failed, retrying in PSRAM");
+     packed_fastbuffer = static_cast<uint8_t *>(
+       heap_caps_aligned_alloc(16, packed_size, MALLOC_CAP_SPIRAM));
+   }
+@@ -829,23 +831,26 @@ bool EPD_Painter::begin() {
+   _pin_le  = make_pin(_config.pin_le);
+   _pin_sph = make_pin(uint8_t(_config.pin_sph));
+ 
+-  if (!(dma_buffer && packed_fastbuffer && packed_screenbuffer)) return false;
++  if (!(dma_buffer1 && dma_buffer2 && packed_fastbuffer && packed_screenbuffer &&
++        packed_paintbuffer && packed_lightbuffer && bitmask && bitmask_light)) return false;
++  clearBuffers();
+ 
+   _paint_active_sem = xSemaphoreCreateBinary();
+-  xSemaphoreGive(_paint_active_sem); 
+   _paint_buffer_sem = xSemaphoreCreateBinary();
++  if (!_paint_active_sem || !_paint_buffer_sem) return false;
++  xSemaphoreGive(_paint_active_sem);
+   xSemaphoreGive(_paint_buffer_sem); 
+ 
+   // Seed the clock rate from the hardware rather than trusting the declared
+   // default — epd_hold_ns() sizes the LE pulse in CPU cycles, so a sketch
+   // running at anything other than 240 MHz would get the wrong width.
+   {
+-    const uint32_t now_mhz = (uint32_t)getCpuFrequencyMhz();
++    const uint32_t now_mhz = (uint32_t)EPD_CPU_MHZ();
+     if (now_mhz) s_epd_cpu_mhz = now_mhz;
+   }
+ 
+-  xTaskCreatePinnedToCore(
+-    _paint_task_entry, "epd_paint", 8000, this, 10, &_paint_task_h, 0);
++  if (xTaskCreatePinnedToCore(
++    _paint_task_entry, "epd_paint", 8000, this, 10, &_paint_task_h, 0) != pdPASS) return false;
+ 
+   // A board that has tuned itself carries its own measurements; they beat
+   // the per-board train files, which beat the formula fallback. Board
+diff --git a/src/EPD_Painter.h b/src/EPD_Painter.h
+index e64d592..767fbe1 100644
+--- a/src/EPD_Painter.h
++++ b/src/EPD_Painter.h
+@@ -434,6 +434,13 @@ struct PowerCtlConfig {
+   // submit-loop rate. No-op cycles (nothing changed) are not counted.
+   uint32_t paintsCompleted() const { return _paints_done.load(); }
+   bool paintIdle() const { return paintStage.load() == 0; }
++  // Native adapter barrier: stage reaches zero BEFORE the final drive cycle.
++  // Only the active semaphore acknowledges physical cycle completion.
++  void waitUntilIdle() {
++    while (paintStage.load() != 0) vTaskDelay(1);
++    xSemaphoreTake(_paint_active_sem, portMAX_DELAY);
++    xSemaphoreGive(_paint_active_sem);
++  }
+   // No-op, kept for API compatibility. Interlace mode existed to spatially
+   // dither the old either-direction-per-chunk deferral artifact; the
+   // dual-plane ink engine drives both directions per pixel in one cycle,
+@@ -458,6 +465,10 @@ struct PowerCtlConfig {
+ 
+   void setQuality(Quality quality);
+ 
++  // 4-level inter-pass settle for NORMAL (see Config::pass_gap_us_normal).
++  // Two-colour content saturates and tolerates a shorter gap; greys shift.
++  void setPassGapNormal(int us) { _config.pass_gap_us_normal = us; }
++
+   // Select the paint engine: false (default) = SIMD dual-plane assembly,
+   // true = the decision engine's C discovery path (see DECISION_ENGINE.md).
+   // Phase B: both produce identical output on 4-level content; the C path
+diff --git a/src/build_opt.h b/src/build_opt.h
+index 63adfc8..b345355 100644
+--- a/src/build_opt.h
++++ b/src/build_opt.h
+@@ -7,6 +7,8 @@
+ 
+ #ifdef ARDUINO
+   #include "esp32-hal.h"   // delay, pinMode, digitalWrite, yield, HIGH/LOW
++  #define EPD_CPU_MHZ()      getCpuFrequencyMhz()
++  #define EPD_WARN(msg)      log_w(msg)
+   #define EPD_DELAY_MS(ms)    delay(ms)
+   #define EPD_DELAY_US(us)    delayMicroseconds(us)
+   #define EPD_PIN_OUTPUT(p)   pinMode((p), OUTPUT)
+@@ -18,6 +20,15 @@
+   #include "freertos/task.h"
+   #include "driver/gpio.h"
+   #include "esp_rom_sys.h"
++  #include "esp_clk_tree.h"
++  #include "esp_log.h"
++  static inline uint32_t epd_hal_cpu_mhz() {
++    uint32_t hz = 0;
++    esp_clk_tree_src_get_freq_hz(SOC_MOD_CLK_CPU, ESP_CLK_TREE_SRC_FREQ_PRECISION_EXACT, &hz);
++    return hz / 1000000;
++  }
++  #define EPD_CPU_MHZ()      epd_hal_cpu_mhz()
++  #define EPD_WARN(msg)      ESP_LOGW("epd", "%s", msg)
+   #define EPD_DELAY_MS(ms)    vTaskDelay(pdMS_TO_TICKS(ms))
+   #define EPD_DELAY_US(us)    esp_rom_delay_us(us)
+   #define EPD_PIN_OUTPUT(p)   gpio_set_direction((gpio_num_t)(p), GPIO_MODE_OUTPUT)
+diff --git a/src/epd_painter_bootctl.cpp b/src/epd_painter_bootctl.cpp
+index 43d3bde..6c9343d 100644
+--- a/src/epd_painter_bootctl.cpp
++++ b/src/epd_painter_bootctl.cpp
+@@ -62,7 +62,7 @@ void EPD_BootCtl::_paintAndPowerOff() {
+         _epd.paintPacked(packed);
+         heap_caps_free(packed);
+     }
+-    delay(500);
++    EPD_DELAY_MS(500);
+     _epd.clearBuffers();
+     _powerOff();  // [[noreturn]]
+ }
+@@ -114,10 +114,10 @@ void EPD_BootCtl::_powerOff() {
+     const EPD_Painter::Config& cfg = _epd.getConfig();
+ 
+     if (cfg.pin_syspwr >= 0) {
+-        pinMode(cfg.pin_syspwr, OUTPUT);
+-        digitalWrite(cfg.pin_syspwr, HIGH);
+-        delay(100);
+-        digitalWrite(cfg.pin_syspwr, LOW);
++        EPD_PIN_OUTPUT(cfg.pin_syspwr);
++        EPD_PIN_HIGH(cfg.pin_syspwr);
++        EPD_DELAY_MS(100);
++        EPD_PIN_LOW(cfg.pin_syspwr);
+         printf("[BOOT] pin_syspwr pulsed. If still running, USB is keeping device alive.\n");
+     } else {
+ #ifdef ARDUINO
+diff --git a/src/epd_painter_bootctl.h b/src/epd_painter_bootctl.h
+index 0659576..e77a87e 100644
+--- a/src/epd_painter_bootctl.h
++++ b/src/epd_painter_bootctl.h
+@@ -82,7 +82,7 @@ private:
+ 
+     void     _init();
+     uint8_t* _getImage() const;
+-    void     _paintAndPowerOff();
++    [[noreturn]] void _paintAndPowerOff();
+ 
+     bool _isUsbConnected() const;
+     [[noreturn]] void _powerOff();
+diff --git a/src/epd_pin_driver.h b/src/epd_pin_driver.h
+index 93e9c13..ce444d0 100644
+--- a/src/epd_pin_driver.h
++++ b/src/epd_pin_driver.h
+@@ -2,9 +2,7 @@
+ #include <stdint.h>
+ #include <soc/gpio_reg.h>
+ 
+-#ifndef IRAM_ATTR
+-  #define IRAM_ATTR
+-#endif
++#include "esp_attr.h"
+ 
+ // =============================================================================
+ // EPD_PinDriver — abstract interface for a single EPD control pin.

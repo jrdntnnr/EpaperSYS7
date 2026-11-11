@@ -1,0 +1,48 @@
+diff --git a/components/macintosh/include/mac.h b/components/macintosh/include/mac.h
+index 6c4af41..5eb5d79 100644
+--- a/components/macintosh/include/mac.h
++++ b/components/macintosh/include/mac.h
+@@ -165,3 +165,6 @@ void mac_mouse_position(int x, int y, bool button);
+ /* The RTC follows the host's local time: set the system clock and TZ and
+  * the Mac has the time. Times the Mac sets itself are kept as an offset.
+  */
++
++/* Flush C buffers and host storage; only between mac_run_frame calls. */
++bool mac_disk_flush(void);
+diff --git a/components/macintosh/sony.c b/components/macintosh/sony.c
+index 751bb29..a904d42 100644
+--- a/components/macintosh/sony.c
++++ b/components/macintosh/sony.c
+@@ -21,6 +21,7 @@
+ #include <string.h>
+ #include <strings.h>
+ #include <sys/stat.h>
++#include <unistd.h>
+ #include "m68k.h"
+ #include "diskspace.h"
+ #include "mac_internal.h"
+@@ -499,7 +500,7 @@ static int fn_prime(void)
+         done += n;
+     }
+     if (write) {
+-        fflush(d->file);
++        if (fflush(d->file) != 0) return failed("prime", pb, 1, ioErr);
+         d->writes += count / 512;
+         d->last_write = mac.frames;
+     } else {
+@@ -858,3 +859,15 @@ void mac_disk_status(mac_disk_status_t *status)
+         status->writes[i] = s_drives[i].writes;
+     }
+ }
++
++bool mac_disk_flush(void)
++{
++    bool ok = true;
++    for (int i=0; i<MAC_DRIVES; ++i) {
++        FILE *file = s_drives[i].file;
++        if (file && !s_drives[i].read_only) {
++            if (fflush(file) != 0 || fsync(fileno(file)) != 0) ok = false;
++        }
++    }
++    return ok;
++}

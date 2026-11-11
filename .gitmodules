@@ -1,0 +1,9 @@
+[submodule "esp32mac"]
+	path = esp32mac
+	url = https://github.com/rlucencic/esp32mac.git
+[submodule "esp32emu"]
+	path = esp32emu
+	url = https://github.com/rlucencic/esp32emu.git
+[submodule "vendor/EPD_Painter"]
+	path = vendor/EPD_Painter
+	url = https://github.com/tonywestonuk/EPD_Painter.git

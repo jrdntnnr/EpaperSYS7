@@ -1,0 +1,22 @@
+{
+  "esp32mac": {
+    "url": "https://github.com/rlucencic/esp32mac.git",
+    "commit": "f7c6f0347ed941209bca4352555f40f47c0716f6",
+    "patch": "patches/esp32mac-storage.patch"
+  },
+  "esp32emu": {
+    "url": "https://github.com/rlucencic/esp32emu.git",
+    "commit": "c704ab404ac582364fc8eb28c882221caf0b7a09"
+  },
+  "vendor/EPD_Painter": {
+    "url": "https://github.com/tonywestonuk/EPD_Painter.git",
+    "commit": "6335a149c5a9b3be4150880e0be64ef2529ba62a",
+    "patch": "patches/epd-painter-idf.patch"
+  },
+  ".toolchains/esp-idf": {
+    "url": "https://github.com/espressif/esp-idf.git",
+    "tag": "v5.5.4",
+    "commit": "735507283d5b2f9fb363a1901172dbd9e847945d",
+    "recursive": true
+  }
+}
